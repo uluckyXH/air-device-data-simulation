@@ -175,6 +175,7 @@ def batch_insert_data(connection_pool, thread_id):
     :param connection_pool: 数据库连接池，用于获取数据库连接
     :param thread_id: 线程ID，用于标识不同的工作线程
     """
+    thread_name = threading.current_thread().name  # 获取当前工作线程的名称
     conn = None    # 数据库连接对象
     cursor = None  # 数据库游标对象
     
@@ -182,6 +183,8 @@ def batch_insert_data(connection_pool, thread_id):
         # 从连接池获取数据库连接
         conn = connection_pool.get_connection()
         cursor = conn.cursor()
+        
+        print(f"[{thread_name}] 工作线程启动，开始处理数据")  # 添加线程启动提示
         
         # 持续处理数据，直到收到停止信号
         while running:  # 检查程序运行状态
@@ -204,6 +207,9 @@ def batch_insert_data(connection_pool, thread_id):
                             check_time_order(thread_id, batch_data)
                             do_batch_insert(cursor, batch_data)
                             conn.commit()  # 提交事务
+                            with thread_locks[thread_id]:
+                                insert_counts[thread_id] += len(batch_data)
+                            print(f"[{thread_name}] 处理完最后一批数据: {len(batch_data)} 条")  # 添加处理完成提示
                         return  # 结束线程
                         
                     # 将数据添加到批处理列表
@@ -217,6 +223,8 @@ def batch_insert_data(connection_pool, thread_id):
                         # 更新该线程的插入计数
                         with thread_locks[thread_id]:
                             insert_counts[thread_id] += len(batch_data)
+                            current_count = insert_counts[thread_id]
+                        print(f"[{thread_name}] 已插入 {current_count} 条数据")  # 添加进度提示
                         batch_data = []  # 清空批处理列表
                     
                 # 处理剩余的数据
@@ -226,12 +234,14 @@ def batch_insert_data(connection_pool, thread_id):
                     conn.commit()  # 提交事务
                     with thread_locks[thread_id]:
                         insert_counts[thread_id] += len(batch_data)
+                        current_count = insert_counts[thread_id]
+                    print(f"[{thread_name}] 已插入 {current_count} 条数据")  # 添加进度提示
                     
             except mysql.connector.Error as err:
                 # 处理数据库操作错误
-                print(f"线程 {thread_id} 数据库操作错误: {err}")
+                print(f"[{thread_name}] 数据库操作错误: {err}")
                 if batch_data:
-                    print(f"失败批次大小: {len(batch_data)}")
+                    print(f"[{thread_name}] 失败批次大小: {len(batch_data)}")
                 # 尝试回滚事务并重新连接
                 try:
                     if conn and conn.is_connected():
@@ -241,7 +251,7 @@ def batch_insert_data(connection_pool, thread_id):
                     
     except Exception as e:
         # 处理其他异常
-        print(f"线程 {thread_id} 发生错误: {e}")
+        print(f"[{thread_name}] 发生错误: {e}")
     finally:
         # 清理资源，确保连接被正确关闭
         try:
@@ -249,8 +259,9 @@ def batch_insert_data(connection_pool, thread_id):
                 cursor.close()  # 关闭游标
             if conn and conn.is_connected():
                 conn.close()   # 关闭连接
+            print(f"[{thread_name}] 工作线程结束，资源已清理")  # 添加线程结束提示
         except Exception as e:
-            print(f"线程 {thread_id} 清理资源时发生错误: {e}")
+            print(f"[{thread_name}] 清理资源时发生错误: {e}")
 
 def do_batch_insert(cursor, batch_data):
     """
@@ -420,6 +431,7 @@ def main():
         start_process_time = time.time()
         
         try:
+            print("[Main] 开始生成数据...")  # 添加主线程标识
             # 主循环：生成数据直到达到结束时间或记录数限制
             while running and current_time <= end_time and (max_records is None or record_count < max_records):
                 # 为每个设备生成一条数据
@@ -436,23 +448,23 @@ def main():
                     if record_count % 10000 == 0:
                         elapsed_time = time.time() - start_process_time
                         speed = record_count / elapsed_time if elapsed_time > 0 else 0
-                        thread_name = threading.current_thread().name
-                        print(f"[{thread_name}] 已生成 {record_count} 条数据，"
+                        print(f"[Main] 已生成 {record_count} 条数据，"  # 修改为主线程标识
                               f"当前时间: {current_time}，"
                               f"速度: {speed:.2f} 条/秒")
                         if max_records:
-                            print(f"[{thread_name}] 进度: {(record_count/max_records)*100:.2f}%")
+                            print(f"[Main] 总进度: {(record_count/max_records)*100:.2f}%")
                 
                 # 时间递增
                 current_time += delta
                 
         except KeyboardInterrupt:
             # 处理用户中断
-            print("\n检测到用户中断，正在安全停止...")
+            print("\n[Main] 检测到用户中断，正在安全停止...")
             running = False
             
         # 发送终止信号
         data_queue.put(None)
+        print("[Main] 已发送终止信号，等待工作线程完成...")
         
         # 等待所有工作线程完成
         for t in threads:
@@ -460,10 +472,10 @@ def main():
             
         # 计算并显示统计信息
         total_time = time.time() - start_process_time
-        print(f"\n数据生成完成！")
-        print(f"共生成 {record_count} 条数据")
-        print(f"总耗时: {total_time:.2f} 秒")
-        print(f"平均速度: {record_count/total_time:.2f} 条/秒")
+        print(f"\n[Main] 数据生成完成！")
+        print(f"[Main] 共生成 {record_count} 条数据")
+        print(f"[Main] 总耗时: {total_time:.2f} 秒")
+        print(f"[Main] 平均速度: {record_count/total_time:.2f} 条/秒")
         
         # 显示每个线程的插入统计
         print("\n各线程插入统计：")
@@ -473,12 +485,10 @@ def main():
 
     except mysql.connector.Error as err:
         # 处理数据库错误
-        thread_name = threading.current_thread().name
-        print(f"\n[{thread_name}] 数据库错误: {err}")
+        print(f"\n[Main] 数据库错误: {err}")
     except Exception as e:
         # 处理其他错误
-        thread_name = threading.current_thread().name
-        print(f"\n[{thread_name}] 发生错误: {e}")
+        print(f"\n[Main] 发生错误: {e}")
     finally:
         # 清理资源
         cleanup_resources()
