@@ -30,6 +30,9 @@ NUM_THREADS = 4             # 工作线程数量，用于并行处理数据
 QUEUE_MAX_SIZE = BATCH_SIZE * 10  # 队列大小
 PROGRESS_INTERVAL = 1000    # 每处理多少条数据显示一次进度
 
+# API配置
+TARGET_TABLE = "air_quality_monitoring_202503"  # 目标数据表名
+
 # 创建线程安全的队列
 data_queue = Queue(maxsize=QUEUE_MAX_SIZE)  # 创建更大的线程安全队列
 
@@ -196,8 +199,8 @@ def process_batch(cursor, batch_data, thread_id, thread_name):
         # 尝试逐条插入
         for data in batch_data:
             try:
-                cursor.execute("""
-                    INSERT INTO air_quality_monitoring_202502 
+                cursor.execute(f"""
+                    INSERT INTO {TARGET_TABLE} 
                     (id, mn, monitor_time, pm25, pm10, co, no2, so2, o3, create_time, update_time)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """, 
@@ -217,8 +220,8 @@ def do_batch_insert(cursor, batch_data):
     :param batch_data: 要插入的数据列表
     """
     # SQL插入语句，包含所有字段
-    sql = """
-    INSERT INTO air_quality_monitoring_202502 
+    sql = f"""
+    INSERT INTO {TARGET_TABLE} 
     (id, mn, monitor_time, pm25, pm10, co, no2, so2, o3, create_time, update_time)
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
@@ -277,8 +280,8 @@ def batch_insert_data(connection_pool, thread_id, start_time, end_time, devices,
                                 # 如果重试失败，尝试逐条插入
                                 for single_data in batch_data:
                                     try:
-                                        cursor.execute("""
-                                            INSERT INTO air_quality_monitoring_202502 
+                                        cursor.execute(f"""
+                                            INSERT INTO {TARGET_TABLE} 
                                             (id, mn, monitor_time, pm25, pm10, co, no2, so2, o3, create_time, update_time)
                                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                                             """, 
@@ -319,8 +322,8 @@ def batch_insert_data(connection_pool, thread_id, start_time, end_time, devices,
                     for mn in devices:
                         data = generate_air_quality_data(mn, current_time)
                         try:
-                            cursor.execute("""
-                                INSERT INTO air_quality_monitoring_202502 
+                            cursor.execute(f"""
+                                INSERT INTO {TARGET_TABLE} 
                                 (id, mn, monitor_time, pm25, pm10, co, no2, so2, o3, create_time, update_time)
                                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                                 """, 
@@ -331,7 +334,6 @@ def batch_insert_data(connection_pool, thread_id, start_time, end_time, devices,
                             with thread_locks[thread_id]:
                                 insert_counts[thread_id] += 1
                         except Exception as e:
-                            # 如果是主键冲突，说明数据已存在，跳过
                             if "Duplicate entry" not in str(e):
                                 print(f"[{thread_name}] 补充数据失败: {e}")
                     current_time += interval
