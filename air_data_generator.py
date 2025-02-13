@@ -27,9 +27,11 @@ PARAMETER_RANGES = {
 # 定义程序运行的关键参数
 BATCH_SIZE = 1000           # 每批次处理的数据量，用于批量插入数据库
 NUM_THREADS = 4             # 工作线程数量，用于并行处理数据
-QUEUE_MAX_SIZE = BATCH_SIZE * 2  # 减小队列大小，避免内存占用过大
+QUEUE_MAX_SIZE = BATCH_SIZE * 10  # 队列大小
 PROGRESS_INTERVAL = 1000    # 每处理多少条数据显示一次进度
-data_queue = Queue(maxsize=QUEUE_MAX_SIZE)  # 创建有限制的线程安全队列
+
+# 创建线程安全的队列
+data_queue = Queue(maxsize=QUEUE_MAX_SIZE)  # 创建更大的线程安全队列
 
 # 创建线程安全的统计和检查机制
 insert_counts = {i: 0 for i in range(NUM_THREADS)}    # 记录每个线程插入的数据量
@@ -171,88 +173,86 @@ def check_time_order(thread_id, batch_data):
         # 更新该线程的最后处理时间，用于下一次检查
         last_times[thread_id] = batch_data[-1]['monitor_time']
 
-def batch_insert_data(connection_pool, thread_id, data_queue):
+def batch_insert_data(connection_pool, thread_id, start_time, end_time, devices, interval):
     """
-    批量插入数据的工作线程函数，负责从队列获取数据并插入数据库
-    :param connection_pool: 数据库连接池，用于获取数据库连接
-    :param thread_id: 线程ID，用于标识不同的工作线程
-    :param data_queue: 该线程专用的数据队列
+    批量插入数据的工作线程函数
     """
-    thread_name = threading.current_thread().name
+    thread_name = f"Worker-{thread_id+1}"
     conn = None
     cursor = None
-    batch_data = []  # 初始化批处理数据列表
-    last_progress_time = time.time()  # 上次进度显示时间
+    batch_data = []
+    current_time = start_time
+    expected_count = 0
     
     try:
-        # 从连接池获取数据库连接
         conn = connection_pool.get_connection()
         cursor = conn.cursor()
         
-        print(f"[{thread_name}] 工作线程启动，开始处理数据")
+        print(f"[{thread_name}] 开始处理时间段: {start_time} 到 {end_time}")
         
-        while running:
-            try:
-                # 从队列中获取数据，设置超时以便定期检查运行状态
-                try:
-                    data = data_queue.get(timeout=0.1)
-                except Empty:
-                    if batch_data:
-                        process_batch(cursor, batch_data, thread_id, thread_name)
-                        conn.commit()
-                        batch_data = []
-                    continue
-
-                # 检查是否收到终止信号
-                if data is None:
-                    if batch_data:
-                        process_batch(cursor, batch_data, thread_id, thread_name)
-                        conn.commit()
+        # 计算预期数据量（包含起始点和结束点）
+        time_points = int((end_time - start_time).total_seconds() / interval.total_seconds()) + 1
+        expected_count = time_points * len(devices)
+        print(f"[{thread_name}] 预期生成数据量: {expected_count} 条")
+        
+        # 使用 <= 确保包含结束时间点
+        while running and current_time <= end_time:
+            for mn in devices:
+                if not running:
                     break
-
-                # 将数据添加到批处理列表
+                    
+                data = generate_air_quality_data(mn, current_time)
                 batch_data.append(data)
                 
-                # 如果达到批处理大小，执行插入
                 if len(batch_data) >= BATCH_SIZE:
                     process_batch(cursor, batch_data, thread_id, thread_name)
                     conn.commit()
                     batch_data = []
-                
-                # 显示定期进度
-                current_time = time.time()
-                if current_time - last_progress_time >= 5:
-                    with thread_locks[thread_id]:
-                        current_count = insert_counts[thread_id]
-                    print(f"[{thread_name}] 当前已处理 {current_count} 条数据")
-                    last_progress_time = current_time
-
-            except mysql.connector.Error as err:
-                print(f"[{thread_name}] 数据库操作错误: {err}")
-                if batch_data:
-                    print(f"[{thread_name}] 失败批次大小: {len(batch_data)}")
-                try:
-                    if conn and conn.is_connected():
-                        conn.rollback()
-                    if conn:
-                        conn.close()
-                    conn = connection_pool.get_connection()
-                    cursor = conn.cursor()
-                except:
-                    time.sleep(1)
-                continue
-                
+            
+            current_time += interval
+        
+        # 处理剩余的数据
+        if batch_data:
+            try:
+                process_batch(cursor, batch_data, thread_id, thread_name)
+                conn.commit()
+            except Exception as e:
+                print(f"[{thread_name}] 处理最后一批数据时出错: {e}")
+                # 尝试逐条插入剩余数据
+                for data in batch_data:
+                    try:
+                        cursor.execute("""
+                            INSERT INTO air_quality_monitoring_202504 
+                            (id, mn, monitor_time, pm25, pm10, co, no2, so2, o3, create_time, update_time)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """, 
+                            (data['id'], data['mn'], data['monitor_time'], data['pm25'], 
+                             data['pm10'], data['co'], data['no2'], data['so2'], data['o3'], 
+                             data['create_time'], data['update_time']))
+                        conn.commit()
+                        with thread_locks[thread_id]:
+                            insert_counts[thread_id] += 1
+                    except Exception as inner_e:
+                        print(f"[{thread_name}] 单条数据插入失败: {inner_e}")
+        
+        # 检查数据完整性
+        actual_count = insert_counts[thread_id]
+        if actual_count != expected_count:
+            print(f"[{thread_name}] 警告：数据不完整！")
+            print(f"[{thread_name}] 预期数据量: {expected_count}")
+            print(f"[{thread_name}] 实际插入量: {actual_count}")
+            print(f"[{thread_name}] 缺失数据量: {expected_count - actual_count}")
+            print(f"[{thread_name}] 时间范围: {start_time} -> {end_time}")
+            print(f"[{thread_name}] 时间点数: {time_points}")
+            
     except Exception as e:
         print(f"[{thread_name}] 发生错误: {e}")
     finally:
-        try:
-            if cursor:
-                cursor.close()
-            if conn and conn.is_connected():
-                conn.close()
-            print(f"[{thread_name}] 工作线程结束，资源已清理")
-        except Exception as e:
-            print(f"[{thread_name}] 清理资源时发生错误: {e}")
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
+        print(f"[{thread_name}] 工作线程结束，资源已清理")
 
 def process_batch(cursor, batch_data, thread_id, thread_name):
     """
@@ -283,7 +283,7 @@ def do_batch_insert(cursor, batch_data):
     """
     # SQL插入语句，包含所有字段
     sql = """
-    INSERT INTO air_quality_monitoring 
+    INSERT INTO air_quality_monitoring_202504 
     (id, mn, monitor_time, pm25, pm10, co, no2, so2, o3, create_time, update_time)
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
@@ -382,161 +382,88 @@ def get_user_input():
     return start_time, end_time, interval, device_count, max_records
 
 def main():
-    """
-    主函数，协调整个程序的运行流程
-    主要职责：
-    1. 初始化系统（信号处理、数据库连接池）
-    2. 获取用户配置参数
-    3. 启动工作线程
-    4. 生成并分发数据
-    5. 监控进度和性能
-    6. 确保程序正确终止
-    """
+    """主函数"""
     global connection_pool, active_threads, running
     
     try:
-        # 注册信号处理器，处理程序终止信号
-        signal.signal(signal.SIGINT, signal_handler)   # 处理 Ctrl+C
-        signal.signal(signal.SIGTERM, signal_handler)  # 处理终止信号
+        # 注册信号处理器
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
         
         # 获取用户输入的参数
         start_time, end_time, interval, device_count, max_records = get_user_input()
         
         # 创建数据库连接池
         print("\n正在初始化数据库连接池...")
-        pool_config = DB_CONFIG.copy()  # 复制配置以避免修改原始配置
-        pool_config['pool_name'] = 'mypool'  # 设置连接池名称
-        pool_config['pool_size'] = NUM_THREADS  # 连接池大小与线程数相同
+        pool_config = DB_CONFIG.copy()
+        pool_config['pool_name'] = 'mypool'
+        pool_config['pool_size'] = NUM_THREADS
         connection_pool = mysql.connector.pooling.MySQLConnectionPool(**pool_config)
         print("数据库连接池创建成功！")
         
         # 根据用户选择设置时间间隔
         if interval == 'second':
-            delta = timedelta(seconds=1)  # 每秒生成一次数据
+            delta = timedelta(seconds=1)
         elif interval == 'minute':
-            delta = timedelta(minutes=1)  # 每分钟生成一次数据
+            delta = timedelta(minutes=1)
         else:
-            delta = timedelta(hours=1)    # 每小时生成一次数据
+            delta = timedelta(hours=1)
 
-        # 生成设备编号列表，格式为MN + 5位数字（如：MN00001）
+        # 生成设备列表
         devices = [f'MN{str(i).zfill(5)}' for i in range(1, device_count + 1)]
         
-        # 计算时间范围并划分给各个线程
-        total_time_range = (end_time - start_time).total_seconds()
-        time_per_thread = total_time_range / NUM_THREADS
-        thread_time_ranges = []
+        # 计算总的时间点数
+        total_seconds = (end_time - start_time).total_seconds()
+        total_points = int(total_seconds / delta.total_seconds()) + 1
+        points_per_thread = total_points // NUM_THREADS
+        remaining_points = total_points % NUM_THREADS
         
-        for i in range(NUM_THREADS):
-            thread_start = start_time + timedelta(seconds=i * time_per_thread)
-            thread_end = start_time + timedelta(seconds=(i + 1) * time_per_thread)
-            if i == NUM_THREADS - 1:  # 最后一个线程处理到结束时间
-                thread_end = end_time
-            thread_time_ranges.append((i, thread_start, thread_end))
+        print(f"\n时间点分配情况:")
+        print(f"总时间点数: {total_points}")
+        print(f"每个线程基础时间点数: {points_per_thread}")
+        print(f"剩余时间点数: {remaining_points}")
         
-        # 打印任务配置信息
-        print(f"\n开始生成数据:")
-        print(f"开始时间: {start_time}")
-        print(f"结束时间: {end_time}")
-        print(f"时间间隔: {interval}")
-        print(f"设备数量: {device_count}")
-        if max_records:
-            print(f"最大记录数: {max_records}")
-        
-        # 创建并启动工作线程池
+        # 创建并启动工作线程
         threads = []
-        thread_queues = []  # 为每个线程创建独立的队列
+        current_start = start_time
         
         for i in range(NUM_THREADS):
-            queue = Queue(maxsize=QUEUE_MAX_SIZE)  # 为每个线程创建独立的队列
-            thread_queues.append(queue)
-            thread_name = f"Worker-{i+1}"
-            t = threading.Thread(target=batch_insert_data, 
-                               args=(connection_pool, i, queue),
-                               name=thread_name)
-            t.start()
-            threads.append(t)
+            # 计算当前线程的时间点数（考虑剩余点数的分配）
+            thread_points = points_per_thread + (1 if i < remaining_points else 0)
+            thread_end = current_start + delta * (thread_points - 1)  # 减1是因为包含起始点
+            
+            if i == NUM_THREADS - 1:
+                thread_end = end_time  # 确保最后一个线程处理到结束时间
+            
+            print(f"线程 {i+1}: {current_start} -> {thread_end} ({thread_points} 点)")
+            
+            thread = threading.Thread(
+                target=batch_insert_data,
+                args=(connection_pool, i, current_start, thread_end, devices, delta),
+                name=f"Worker-{i+1}"
+            )
+            thread.start()
+            threads.append(thread)
+            
+            current_start = thread_end + delta  # 下一个线程的开始时间
         
-        # 保存活动线程列表，用于资源清理
+        # 保存活动线程列表
         active_threads = threads
         
-        # 初始化数据生成计数器和性能监控
-        record_count = 0          # 已生成的记录总数
-        start_process_time = time.time()  # 程序开始时间
-        
-        try:
-            print("[Main] 开始生成数据...")
-            last_progress_time = time.time()
-            
-            # 为每个时间范围生成数据
-            for thread_id, thread_start, thread_end in thread_time_ranges:
-                current_time = thread_start
-                
-                while running and current_time <= thread_end and (max_records is None or record_count < max_records):
-                    # 为每个设备生成当前时间点的数据
-                    for mn in devices:
-                        if not running or (max_records is not None and record_count >= max_records):
-                            break
-                            
-                        # 检查队列大小，如果接近满，则等待一段时间
-                        while thread_queues[thread_id].qsize() >= QUEUE_MAX_SIZE * 0.8:
-                            print(f"[Main] 线程 {thread_id} 队列接近满载，等待处理...")
-                            time.sleep(0.1)
-                            
-                        # 生成数据并放入对应线程的队列
-                        data = generate_air_quality_data(mn, current_time)
-                        try:
-                            thread_queues[thread_id].put(data, timeout=1)
-                            record_count += 1
-                            
-                            # 显示进度
-                            if record_count % PROGRESS_INTERVAL == 0:
-                                current_time_check = time.time()
-                                if current_time_check - last_progress_time >= 1:
-                                    elapsed_time = current_time_check - start_process_time
-                                    speed = record_count / elapsed_time if elapsed_time > 0 else 0
-                                    print(f"[Main] 已生成 {record_count} 条数据，"
-                                          f"当前时间: {current_time}，"
-                                          f"速度: {speed:.2f} 条/秒")
-                                    if max_records:
-                                        print(f"[Main] 总进度: {(record_count/max_records)*100:.2f}%")
-                                    last_progress_time = current_time_check
-                                    
-                        except Queue.Full:
-                            print(f"[Main] 警告：线程 {thread_id} 队列已满，等待处理...")
-                            time.sleep(0.1)
-                            continue
-                            
-                    current_time += delta
-            
-            # 向所有线程发送终止信号
-            for queue in thread_queues:
-                queue.put(None)
-                
-        except KeyboardInterrupt:
-            print("\n[Main] 检测到用户中断，正在安全停止...")
-            running = False
-            
-        # 等待所有工作线程完成
+        # 等待所有线程完成
         for t in threads:
             t.join()
             
-        # 计算并显示最终统计信息
-        total_time = time.time() - start_process_time
-        print(f"\n[Main] 数据生成完成！")
-        print(f"[Main] 共生成 {record_count} 条数据")
-        print(f"[Main] 总耗时: {total_time:.2f} 秒")
-        print(f"[Main] 平均速度: {record_count/total_time:.2f} 条/秒")
-        
-        # 显示各工作线程的数据处理统计
+        # 显示最终统计信息
+        total_records = sum(insert_counts.values())
+        print(f"\n数据生成完成！")
+        print(f"总共插入 {total_records} 条数据")
         print("\n各线程插入统计：")
         for thread_id in range(NUM_THREADS):
-            thread_name = f"Worker-{thread_id+1}"
-            print(f"[{thread_name}] 插入 {insert_counts[thread_id]} 条数据")
+            print(f"Worker-{thread_id+1}: {insert_counts[thread_id]} 条")
             
-    except mysql.connector.Error as err:
-        print(f"\n[Main] 数据库错误: {err}")
     except Exception as e:
-        print(f"\n[Main] 发生错误: {e}")
+        print(f"\n程序错误: {e}")
     finally:
         cleanup_resources()
 
