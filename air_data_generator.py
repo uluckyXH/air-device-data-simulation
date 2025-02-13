@@ -173,6 +173,62 @@ def check_time_order(thread_id, batch_data):
         # 更新该线程的最后处理时间，用于下一次检查
         last_times[thread_id] = batch_data[-1]['monitor_time']
 
+def process_batch(cursor, batch_data, thread_id, thread_name):
+    """
+    处理一批数据，包括检查时间顺序和插入数据库
+    :param cursor: 数据库游标
+    :param batch_data: 要处理的数据批次
+    :param thread_id: 线程ID
+    :param thread_name: 线程名称
+    """
+    try:
+        # 检查时间顺序
+        check_time_order(thread_id, batch_data)
+        # 执行批量插入
+        do_batch_insert(cursor, batch_data)
+        # 更新计数器
+        with thread_locks[thread_id]:
+            insert_counts[thread_id] += len(batch_data)
+            current_count = insert_counts[thread_id]
+        print(f"[{thread_name}] 已插入 {current_count} 条数据")
+    except Exception as e:
+        print(f"[{thread_name}] 处理批量插入时发生错误: {e}")
+        # 尝试逐条插入
+        for data in batch_data:
+            try:
+                cursor.execute("""
+                    INSERT INTO air_quality_monitoring_202502 
+                    (id, mn, monitor_time, pm25, pm10, co, no2, so2, o3, create_time, update_time)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, 
+                    (data['id'], data['mn'], data['monitor_time'], data['pm25'], 
+                     data['pm10'], data['co'], data['no2'], data['so2'], data['o3'], 
+                     data['create_time'], data['update_time']))
+                cursor.connection.commit()
+                with thread_locks[thread_id]:
+                    insert_counts[thread_id] += 1
+            except Exception as inner_e:
+                print(f"[{thread_name}] 单条数据插入失败: {inner_e}")
+
+def do_batch_insert(cursor, batch_data):
+    """
+    执行批量插入操作，将数据写入数据库
+    :param cursor: 数据库游标
+    :param batch_data: 要插入的数据列表
+    """
+    # SQL插入语句，包含所有字段
+    sql = """
+    INSERT INTO air_quality_monitoring_202502 
+    (id, mn, monitor_time, pm25, pm10, co, no2, so2, o3, create_time, update_time)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    # 准备批量插入的数据，将字典转换为元组列表
+    values = [(d['id'], d['mn'], d['monitor_time'], d['pm25'], d['pm10'], 
+              d['co'], d['no2'], d['so2'], d['o3'], d['create_time'], 
+              d['update_time']) for d in batch_data]
+    # 执行批量插入操作
+    cursor.executemany(sql, values)
+
 def batch_insert_data(connection_pool, thread_id, start_time, end_time, devices, interval):
     """
     批量插入数据的工作线程函数
@@ -183,6 +239,8 @@ def batch_insert_data(connection_pool, thread_id, start_time, end_time, devices,
     batch_data = []
     current_time = start_time
     expected_count = 0
+    retry_count = 0
+    MAX_RETRIES = 3
     
     try:
         conn = connection_pool.get_connection()
@@ -205,35 +263,43 @@ def batch_insert_data(connection_pool, thread_id, start_time, end_time, devices,
                 batch_data.append(data)
                 
                 if len(batch_data) >= BATCH_SIZE:
-                    process_batch(cursor, batch_data, thread_id, thread_name)
-                    conn.commit()
-                    batch_data = []
+                    while retry_count < MAX_RETRIES:
+                        try:
+                            process_batch(cursor, batch_data, thread_id, thread_name)
+                            conn.commit()
+                            batch_data = []
+                            retry_count = 0
+                            break
+                        except Exception as e:
+                            retry_count += 1
+                            print(f"[{thread_name}] 批量插入重试 ({retry_count}/{MAX_RETRIES}): {e}")
+                            if retry_count >= MAX_RETRIES:
+                                # 如果重试失败，尝试逐条插入
+                                for single_data in batch_data:
+                                    try:
+                                        cursor.execute("""
+                                            INSERT INTO air_quality_monitoring_202502 
+                                            (id, mn, monitor_time, pm25, pm10, co, no2, so2, o3, create_time, update_time)
+                                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                            """, 
+                                            (single_data['id'], single_data['mn'], single_data['monitor_time'], 
+                                             single_data['pm25'], single_data['pm10'], single_data['co'], 
+                                             single_data['no2'], single_data['so2'], single_data['o3'], 
+                                             single_data['create_time'], single_data['update_time']))
+                                        conn.commit()
+                                        with thread_locks[thread_id]:
+                                            insert_counts[thread_id] += 1
+                                    except Exception as inner_e:
+                                        print(f"[{thread_name}] 单条数据插入失败: {inner_e}")
+                                batch_data = []
+                                retry_count = 0
             
             current_time += interval
         
         # 处理剩余的数据
         if batch_data:
-            try:
-                process_batch(cursor, batch_data, thread_id, thread_name)
-                conn.commit()
-            except Exception as e:
-                print(f"[{thread_name}] 处理最后一批数据时出错: {e}")
-                # 尝试逐条插入剩余数据
-                for data in batch_data:
-                    try:
-                        cursor.execute("""
-                            INSERT INTO air_quality_monitoring_202504 
-                            (id, mn, monitor_time, pm25, pm10, co, no2, so2, o3, create_time, update_time)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            """, 
-                            (data['id'], data['mn'], data['monitor_time'], data['pm25'], 
-                             data['pm10'], data['co'], data['no2'], data['so2'], data['o3'], 
-                             data['create_time'], data['update_time']))
-                        conn.commit()
-                        with thread_locks[thread_id]:
-                            insert_counts[thread_id] += 1
-                    except Exception as inner_e:
-                        print(f"[{thread_name}] 单条数据插入失败: {inner_e}")
+            process_batch(cursor, batch_data, thread_id, thread_name)
+            conn.commit()
         
         # 检查数据完整性
         actual_count = insert_counts[thread_id]
@@ -245,6 +311,31 @@ def batch_insert_data(connection_pool, thread_id, start_time, end_time, devices,
             print(f"[{thread_name}] 时间范围: {start_time} -> {end_time}")
             print(f"[{thread_name}] 时间点数: {time_points}")
             
+            # 尝试补充缺失的数据
+            if actual_count < expected_count:
+                print(f"[{thread_name}] 尝试补充缺失数据...")
+                current_time = start_time
+                while current_time <= end_time:
+                    for mn in devices:
+                        data = generate_air_quality_data(mn, current_time)
+                        try:
+                            cursor.execute("""
+                                INSERT INTO air_quality_monitoring_202502 
+                                (id, mn, monitor_time, pm25, pm10, co, no2, so2, o3, create_time, update_time)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                """, 
+                                (data['id'], data['mn'], data['monitor_time'], data['pm25'], 
+                                 data['pm10'], data['co'], data['no2'], data['so2'], data['o3'], 
+                                 data['create_time'], data['update_time']))
+                            conn.commit()
+                            with thread_locks[thread_id]:
+                                insert_counts[thread_id] += 1
+                        except Exception as e:
+                            # 如果是主键冲突，说明数据已存在，跳过
+                            if "Duplicate entry" not in str(e):
+                                print(f"[{thread_name}] 补充数据失败: {e}")
+                    current_time += interval
+            
     except Exception as e:
         print(f"[{thread_name}] 发生错误: {e}")
     finally:
@@ -253,46 +344,6 @@ def batch_insert_data(connection_pool, thread_id, start_time, end_time, devices,
         if conn and conn.is_connected():
             conn.close()
         print(f"[{thread_name}] 工作线程结束，资源已清理")
-
-def process_batch(cursor, batch_data, thread_id, thread_name):
-    """
-    处理一批数据，包括检查时间顺序和插入数据库
-    :param cursor: 数据库游标
-    :param batch_data: 要处理的数据批次
-    :param thread_id: 线程ID
-    :param thread_name: 线程名称
-    """
-    try:
-        # 检查时间顺序
-        check_time_order(thread_id, batch_data)
-        # 执行批量插入
-        do_batch_insert(cursor, batch_data)
-        # 更新计数器
-        with thread_locks[thread_id]:
-            insert_counts[thread_id] += len(batch_data)
-            current_count = insert_counts[thread_id]
-        print(f"[{thread_name}] 已插入 {current_count} 条数据")
-    except Exception as e:
-        print(f"[{thread_name}] 处理批量插入时发生错误: {e}")
-
-def do_batch_insert(cursor, batch_data):
-    """
-    执行批量插入操作，将数据写入数据库
-    :param cursor: 数据库游标
-    :param batch_data: 要插入的数据列表
-    """
-    # SQL插入语句，包含所有字段
-    sql = """
-    INSERT INTO air_quality_monitoring_202504 
-    (id, mn, monitor_time, pm25, pm10, co, no2, so2, o3, create_time, update_time)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """
-    # 准备批量插入的数据，将字典转换为元组列表
-    values = [(d['id'], d['mn'], d['monitor_time'], d['pm25'], d['pm10'], 
-              d['co'], d['no2'], d['so2'], d['o3'], d['create_time'], 
-              d['update_time']) for d in batch_data]
-    # 执行批量插入操作
-    cursor.executemany(sql, values)
 
 def get_user_input():
     """
@@ -412,14 +463,17 @@ def main():
         # 生成设备列表
         devices = [f'MN{str(i).zfill(5)}' for i in range(1, device_count + 1)]
         
-        # 计算总的时间点数
+        # 计算总的时间点数和预期总数据量
         total_seconds = (end_time - start_time).total_seconds()
         total_points = int(total_seconds / delta.total_seconds()) + 1
+        total_expected_records = total_points * device_count
         points_per_thread = total_points // NUM_THREADS
         remaining_points = total_points % NUM_THREADS
         
-        print(f"\n时间点分配情况:")
+        print(f"\n数据生成预估:")
         print(f"总时间点数: {total_points}")
+        print(f"设备数量: {device_count}")
+        print(f"预计总数据量: {total_expected_records} 条")
         print(f"每个线程基础时间点数: {points_per_thread}")
         print(f"剩余时间点数: {remaining_points}")
         
@@ -455,12 +509,22 @@ def main():
             t.join()
             
         # 显示最终统计信息
-        total_records = sum(insert_counts.values())
+        total_inserted = sum(insert_counts.values())
         print(f"\n数据生成完成！")
-        print(f"总共插入 {total_records} 条数据")
+        print(f"预计总数据量: {total_expected_records} 条")
+        print(f"实际插入总量: {total_inserted} 条")
+        if total_inserted != total_expected_records:
+            print(f"数据缺失量: {total_expected_records - total_inserted} 条")
+            print(f"完成率: {(total_inserted/total_expected_records)*100:.2f}%")
+        else:
+            print("数据生成完整，无缺失")
+            
         print("\n各线程插入统计：")
         for thread_id in range(NUM_THREADS):
-            print(f"Worker-{thread_id+1}: {insert_counts[thread_id]} 条")
+            thread_expected = (points_per_thread + (1 if thread_id < remaining_points else 0)) * device_count
+            actual = insert_counts[thread_id]
+            print(f"Worker-{thread_id+1}: 预期 {thread_expected} 条, 实际 {actual} 条, " + 
+                  (f"完成率 {(actual/thread_expected)*100:.2f}%" if actual != thread_expected else "完整"))
             
     except Exception as e:
         print(f"\n程序错误: {e}")
